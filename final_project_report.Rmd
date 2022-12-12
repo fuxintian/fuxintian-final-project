@@ -1,0 +1,413 @@
+---
+title: "Building a hotel reservation cancellation model"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message = F, warning = F)
+```
+
+## Introduction
+
+The aim of this project is to build a machine learning model that can predict whether or not a hotel room reservation will be cancelled. 
+
+### Why might this model be useful?
+
+The hotel industry has developed throughout time, with the majority of reservations made in advance. The use of hotel booking systems makes business more efficient, accurate, and productive for hotels. Cancellation of bookings is currently one of the problems in hotel management. If a booking is cancelled and the hotel is unable to locate a replacement guest to take the room, the hotel will suffer a negative financial impact.
+
+We will use a real hotel booking dataset to build a classification model that will predict whether or not a booking will be canceled with the greatest accuracy possible, as well as gain insights into the customers' behavior or reasons for canceling their reservation.
+
+## Exploratory Data Analysis
+
+The dataset originates from an open hotel booking demand dataset provided by Antonio et al. (2019). The authors gathered information from two Portuguese hotels. One of the hotels was a resort (H1) and the other was a city hotel (H2). The information was gathered between July 2015 and August 2017. However, because the H2 hotel was in the middle of a soft opening, the authors collected data from September, 2015. 
+
+### Loading Data and Packages
+
+The data is available at Kaggle (https://www.kaggle.com/datasets/jessemostipak/hotel-booking-demand). 
+
+```{r}
+library(readr)
+library(lubridate)
+library(tidyverse)
+library(corrplot)
+library(gtsummary)
+library(tidymodels)
+library(vip)
+library(treeshap)
+theme_set(theme_bw())
+```
+
+
+```{r}
+# load data
+hotel_booking = read_csv("data/unprocessed/hotel_bookings.csv",
+                         show_col_types = FALSE)
+
+# get the dim of the data
+dim(hotel_booking)
+
+# calculate number of records by hotel name and cancellation status
+table(hotel_booking$is_canceled, hotel_booking$hotel)
+```
+
+There are overall 119,390 records and 32 variables. The data has 40,060 records from the Resort Hotel with 28% of them being cancelled, and 79,330 records from City Hotel with 42% of them being cancelled. 
+
+### Data cleaning
+
+There are 32 variables in the raw data. The columns "country," "agent," and "company" were eliminated because they included missing values and the variables themselves had too many levels to be adequately analyzed. The columns "reservation_status" were removed because it shows the status of the booking. We used 0 to fill in the four missing entries in the "children" column. The dataset has 34,082 duplicated rows, which amount for 28.5% of the total entries. Because the data was created by combining multiple tables from a reservation system, we assumed that the large number of duplicates came from the merging process. As a result, we deleted the duplicated rows.
+
+```{r}
+hotel_booking.clean = hotel_booking %>% 
+  # remove unimportant columns
+  select(-c(country, agent, company)) %>% 
+  # remove other outcome related variables
+  select(-c(reservation_status, reservation_status_date))
+
+# remove duplicated rows
+hotel_booking.clean = hotel_booking.clean %>% 
+  distinct()
+```
+
+The meal type "SC" and "Undefined" both represent no meal package, so we could combine them into one group. There are 4 observations without number of children and we assume they do not have children. 98.9% of records do not have any baby, 1% have one baby, and the others range between 2 and 10. We would redefine the baby as a binary variable of with or without baby.
+
+```{r}
+hotel_booking.clean = hotel_booking.clean %>% 
+  mutate(
+    # clean meal
+    meal = ifelse(meal %in% c("Undefined", "SC"), "NO", meal),
+    # impute missing of children
+    children = ifelse(is.na(children), 0, children),
+    # clean baby
+    babies = ifelse(babies == 0, 0, 1)
+  ) %>% 
+  # convert month from character to number
+  unite(date, c(arrival_date_year, arrival_date_month, arrival_date_day_of_month), remove = F) %>% 
+  mutate(date = ymd(date)) %>% 
+  mutate(arrival_date_month = month(date)) %>% 
+  select(-date) %>% 
+  # convert outcome to factor
+  mutate(is_canceled = as.factor(is_canceled))
+```
+
+There are two unusual values in the average daily rate (`adr`) – a negative minimum and a very high maximum. We will remove these two outliers. 5 records in which market segment designation is undefined or distribution channel is undefined with a 100% cancellation rate. These records need to be removed from the data.
+
+```{r}
+# clean unusual records
+hotel_booking.clean = hotel_booking.clean %>% 
+  filter(adr >= 0, adr <= 500) %>% 
+  filter(market_segment!="Undefined", distribution_channel!="Undefined")
+```
+
+
+### Cleaned data description
+
+```{r}
+hotel_booking.clean = write_csv(hotel_booking.clean, file = "data/processed/hotel_booking_cleaned.csv")
+```
+
+
+The cleaned data set includes 85308 observations with 27 variables, 26 of which are predictors and the response variable `is_canceled`. While the complete codebook is available, the following are some of the essential variables:
+
+- `lead_time`: Number of days that elapsed between the entering date of the booking into the PMS and the arrival date
+
+- `arrival_date_year`, `arrival_date_month`, `arrival_date_week_number`, `arrival_date_day_of_month`: Description of arrival date
+
+- `adults`, `children`, `babies`: Description of guests
+
+- `meal`, `required_car_parking_spaces`: Special request 
+
+### Data split
+
+The data was split in a 80% training, 20% testing split, stratified by the outcome `is_canceled`.
+
+```{r}
+# data split
+set.seed(123)
+hotel_booking.clean.split = hotel_booking.clean %>%
+  initial_split(prop = 0.8, strata = "is_canceled")
+hotel_train = training(hotel_booking.clean.split) 
+hotel_test = testing(hotel_booking.clean.split)
+```
+
+The training data set has about 68,238 observations and the testing data set has just under 17,061 observations.
+
+### Visual EDA
+
+The exploratory data analysis will be based only on the training set. Each observation represents a booking records.
+
+The proportion of cancellations has increased over time since 2016. Reservations for rooms in November and January of the same year were more likely to be honored. More bookings were canceled between April and August.
+
+```{r}
+# proportion of cancellation by month of arrival
+hotel_train %>% 
+  unite(date, c(arrival_date_year, arrival_date_month)) %>% 
+  mutate(date = ym(date)) %>% 
+  group_by(date) %>% 
+  summarise(is_canceled_prop = sum(is_canceled==1)/ n()) %>% 
+  ggplot(aes(x = date, y = is_canceled_prop)) +
+  geom_line() +
+  labs(x = "Date", y = "Proportion of cancellation")
+```
+
+Bookings through travel agents and tour operators (`TA/TO`) are more likely to be canceled than other distribution channels such as corporate, direct, and global distribution system (`gds`). I believe this is due to more individual tourists choosing `TA/TO`, which has a higher possibility of itinerary adjustments. Corporate travelers are those that travel for work and are less likely to have schedule adjustments.
+
+```{r}
+# proportion of cancellation by distribution channel
+hotel_train %>% 
+  group_by(distribution_channel) %>% 
+  summarise(is_canceled_prop = sum(is_canceled==1)/ n()) %>% 
+  ggplot(aes(x = distribution_channel, y = is_canceled_prop)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Distribution channel", y = "Proportion of cancellation")
+```
+
+Most of the bookings did not require a deposit. The cancellation rates of both no deposit and required refundable deposit were similar at 26%. Surprisingly, customers who paid a non-refundable deposit have a 94% cancellation rate. Further investigation for customers who chose a non-refund deposit is needed.
+
+```{r}
+# proportion of cancellation by deposit type
+hotel_train %>% 
+  group_by(deposit_type) %>% 
+  summarise(is_canceled_prop = sum(is_canceled==1)/ n()) %>% 
+  ggplot(aes(x = deposit_type, y = is_canceled_prop)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Deposit type", y = "Proportion of cancellation")
+```
+
+In terms of the association between special requests and cancellation booking status, it appears that the greater the number of special requests, the less likely the booking was canceled.
+
+```{r}
+# proportion of cancellation by number of special requests
+hotel_train %>% 
+  mutate(total_of_special_requests = as.factor(total_of_special_requests)) %>% 
+  group_by(total_of_special_requests) %>% 
+  summarise(is_canceled_prop = sum(is_canceled==1)/ n()) %>% 
+  ggplot(aes(x = total_of_special_requests, y = is_canceled_prop)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Total of special requests", y = "Proportion of cancellation")
+```
+
+A strong correlation generally indicates the presence of duplicate features. In the Pearson's correlation matrix of numerical variables, no feature is highly correlated with another (>|0.7|).
+
+```{r}
+# select numeric variables
+hotel_num = hotel_train %>% 
+  select(previous_cancellations, days_in_waiting_list, booking_changes,
+         stays_in_week_nights, stays_in_weekend_nights, lead_time,
+         adults, children, total_of_special_requests, adr)
+# calculating the correlation between each variable
+hotel_cor = cor(hotel_num) 
+# correlation plot
+corrplot(hotel_cor, 
+         order = 'AOE',
+         col = COL2("PiYG"))
+```
+
+In the following summary table, we could see that the city hotel has a higher cancellation rate than that of resort hotel, a higher number of days between booking and arrival (`leak_time`) is associated with higher probability of cancellation, a higher average daily rate (`adr`) is associated with higher probability of cancellation, requirement of car spaces (`required_car_parking_spaces`) is associated with lower probability of cancellation, and more total number of special requests (`total_of_special_requests`) is associated with lower probability of cancellation.
+
+```{r}
+tbl_summary(
+  hotel_train,
+  by = "is_canceled",
+  percent = "row"
+)
+```
+
+## Model Building
+
+### Recipe Building
+
+We establish one primary recipe for all of our models to work with because we will be using the same predictors and response variables. All predictors are centered and scaled once categorical data are transformed to one-hot encoded variables. The reserved room type and the assigned room type have some levels with too few observations, so we could combine them into "other" to simplify the calculation. All the records with at least one required car parking space were not canceled, so we could create a binary variable of with or  without the requirement of a car parking space.
+
+```{r}
+# build model recipe
+model_recipe = recipe(is_canceled ~ hotel + lead_time + arrival_date_year + arrival_date_month + 
+                        arrival_date_week_number + arrival_date_day_of_month + stays_in_weekend_nights +
+                        stays_in_week_nights + adults + children + babies + meal + market_segment + 
+                        distribution_channel + is_repeated_guest + previous_cancellations + 
+                        previous_bookings_not_canceled + reserved_room_type + assigned_room_type + 
+                        booking_changes + deposit_type + days_in_waiting_list + customer_type + 
+                        adr + required_car_parking_spaces + total_of_special_requests,
+                      data = hotel_train) %>%
+  # reduce number of small categorical levels
+  step_other(reserved_room_type, threshold = 500) %>%
+  step_other(assigned_room_type, threshold = 500) %>%
+  step_num2factor(required_car_parking_spaces,
+                  transform = function(x) {x = cut(x, breaks = c(-1,0,8), include.lowerest=T); as.numeric(x)},
+                  levels = c("No", "Yes")) %>% 
+  # encode categorical variables
+  step_dummy(hotel, meal, market_segment, distribution_channel, required_car_parking_spaces,
+             reserved_room_type, assigned_room_type, deposit_type, customer_type,
+             one_hot = TRUE) %>%
+  # center and scale all predictors
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+```
+
+We are going to use 5-fold cross validation repeated 3 times for model evaluation.
+
+```{r}
+# create cv data
+set.seed(123)
+cv_folds = vfold_cv(hotel_train, v = 5, repeats = 3, strata = is_canceled)
+```
+
+```{r}
+save(hotel_train, cv_folds, model_recipe, file = "data/model/model_data.rda")
+```
+
+### Running The Models
+
+We will be trying the following model methods:
+
+- Logistic regression
+
+- Lasso regression
+
+- Decision tree classification
+
+- K-NN classification
+
+- Random forest classification
+
+With our limited computation power, it took several days to build the model and tune the parameters. The scripts of the modeling building are located at `R_scripts` and the fitted results are located at `data/model`. 
+
+### Results of our Models
+
+```{r}
+load("data/model/logistic_model.rda")
+load("data/model/lasso_model.rda")
+load("data/model/knn_model.rda")
+load("data/model/decisiontree_model.rda")
+load("data/model/rf_model.rda")
+```
+
+
+#### Lasso model
+
+For the lasso, we had one level of penalty. We can see from the graph that the accuracy remained stable when the penalty was less than 0.003 and that a higher penalty caused the accuracy to drop.
+
+```{r}
+autoplot(lasso_fit)
+```
+
+
+#### Decision Tree Model
+
+For the decision tree, we had two different levels of minimal cost-complexity and tree depth. We can see from the graph that the optimal tree depth was around 15 and penalties greater than 0.0001 caused the accuracy of the decision tree to drop.
+
+```{r}
+autoplot(decisiontree_fit)
+```
+
+### KNN Model
+
+The AUC increases as number of nearest neighbors increases. But the AUC becomes stable when number of nearest neighbors is above 50. 
+
+```{r}
+autoplot(knn_fit)
+```
+
+### Random forest model
+
+In our random forest model, we tuned three different parameters: the number of randomly selected predictors (`mtry`), number of trees (`trees`), and the minimal node size (`min_n`). When the number of predictors is less than 10, the accuracy increases as the number of predictors increases. The optimal minimum node size is roughly ten. The number of trees has no substantial relationship with the AUC.
+
+```{r}
+autoplot(rf_fit)
+```
+
+### Accuracy of Each Models
+
+To compare the best ROC AUC scores for each model, we fitted each model with the parameters selected using the resampling results. The random forest model has the highest AUC score among the five modeling methods.
+
+The random forest model will be used as the final model because it performed best on the training dataset.
+
+```{r, results='hide'}
+roc_table = tibble(
+  model = c("LR", "Lasso", "KNN", "Decision Tree", "Random Forest"),
+  AUC = 0
+)
+roc_table$AUC[1] = lr_training_pred %>%               
+  roc_auc(truth = is_canceled, .pred_0) %>% pull(.estimate)
+roc_table$AUC[2] = lasso_training_pred %>%               
+  roc_auc(truth = is_canceled, .pred_0) %>% pull(.estimate)
+roc_table$AUC[3] = knn_training_pred %>%               
+  roc_auc(truth = is_canceled, .pred_0) %>% pull(.estimate)
+roc_table$AUC[4] = decisiontree_training_pred %>%               
+  roc_auc(truth = is_canceled, .pred_0) %>% pull(.estimate)
+roc_table$AUC[5] = rf_training_pred %>%               
+  roc_auc(truth = is_canceled, .pred_0) %>% pull(.estimate)
+ggplot(roc_table, 
+       aes(x = reorder(model, -AUC), y = AUC)) + 
+  geom_bar(stat = "identity")
+  xlab("Model")
+```
+
+### Final Model
+
+Let's have a look at the final model. We will first evaluate the model's performance on the test dataset. On the new observations, the ROC curve looks great, indicating that the model has strong determination capacity.
+
+```{r}
+# generate predicted probability
+hotel_test = predict(rf_result, hotel_test, type = "prob") %>% 
+  bind_cols(hotel_test %>% select(is_canceled) %>% mutate(is_canceled = as.factor(is_canceled)))
+# roc curve
+rf_roc_curve = hotel_test %>% 
+  roc_curve(is_canceled, estimate = .pred_0) 
+autoplot(rf_roc_curve)
+```
+
+The following matrix is obtained using threshold of prediction at 0.5. We could consider adjusting the threshold with different objectives. For example, we could define misclassification cost of false positives and false negatives in a hotel setting and find an optimal cutoff point.
+
+```{r}
+# heatmap of confusion matrix
+hotel_test %>%
+  mutate(is_canceled = factor(is_canceled, levels = c(0,1), labels=c("Not Canceled", "Canceled")),
+         prediction = factor(ifelse(hotel_test$.pred_1>0.5, "Canceled", "Not Canceled"),
+                             levels = c("Not Canceled", "Canceled"))) %>% 
+  conf_mat(truth = is_canceled, estimate = prediction) %>%
+  autoplot(type = "heatmap")
+```
+
+
+Next, let's check out the importance of features. The permutation feature importance plot shows a summary of the importance of each feature to the random forest model. The feature importance is the mean decrease in a model impurity when a single feature value is permuted. The most important feature is number of days between the booking date and the arrival date, followed by the average daily rate.
+
+```{r}
+rf_result %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features = 10)
+```
+
+The Shapley value for a feature value shows its contribution to the prediction of a given instance in contrast to the average prediction for the whole dataset. The feature importance of Shapley values is more related to the feature's influence on the model prediction. This plot shows us average absolute impact of features on the prediction of the model. The number of days between the booking date and the arrival date influence the prediction of the model the most, followed by total number of special requests.
+
+```{r}
+load("data/model/rf_final_model.rda")
+plot_feature_importance(treeshap_res, max_vars = 10)
+```
+
+The number of days between the booking date and the arrival date has a non-linear effect. When the lead time is short, the estimated risk of cancellation grows rapidly as the lead time grows. When the lead time is long, the marginal impact is smaller than when it is short.
+
+```{r}
+plot_feature_dependence(treeshap_res, "lead_time")
+```
+
+The greater the amount of special requests, the lesser the likelihood of cancellation. However, the marginal impact of a high number of special requests is not significant.
+
+```{r}
+plot_feature_dependence(treeshap_res, "total_of_special_requests")
+```
+
+We could even break down how we get the predicted risk of cancellation using the Shapley method. For a record, the average probability of cancellation is 0.28; a standardized lead time of 7.7 increases the risk by 0.101; a market segment by travel agency decreases the risk by 0.051; a standardized booking change of 5.05 decreases the risk by 0.05; a standardized average daily rate of -2.04 decreases the risk by 0.049; and all other features of the record decrease the risk by 0.045. As a result, the expected risk of cancellation is 0.155.
+
+```{r}
+plot_contribution(treeshap_res, obs = 1)
+```
+
+## Conclusion
+
+This study aims to explore the use of predictive analysis in cases of hotel cancellations. We find the best machine learning model to be the random forest model in this case. The AUC of the model on the test data set is 0.865. Furthermore, we used explainable machine learning methods, including the permutation feature importance and the Shapley value, to extract and interpret information from the random forest model. We find that the number of days between the booking date and the arrival date and the average daily rate are the two most important features that have the most impact on the impurity of the model, while the average daily rate and number of special requests impact the predicted probability the most. Customers who require more special requests or have a shorter time between booking and arrival are less likely to cancel. The association found between features and the predicted outcome can suggest which actions are appropriate to take for each identified booking and improve the overall hotel management efficiency. 
